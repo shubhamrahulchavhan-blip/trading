@@ -3,7 +3,7 @@
 NIFTY intraday signal notifier (free alternative to TradingView alerts).
 
 A Python port of nifty_intraday_signals.pine. It polls 5-minute NIFTY data, evaluates the
-same gates / setups / weighted score on CLOSED candles only, and sends Telegram and/or email
+same gates / setups / weighted score on CLOSED candles only, and sends an email
 when a BUY CE / BUY PE signal or an exit (target, stop-loss, opposite, time) occurs.
 
 Notes
@@ -15,7 +15,7 @@ Notes
 - Educational tool, not investment advice.
 
 Setup:  pip install yfinance pandas numpy requests
-Run:    python nifty_notifier.py --test      (sends a test message)
+Run:    python nifty_notifier.py --test      (sends a test email)
         python nifty_notifier.py             (runs during market hours)
 """
 import argparse, json, os, smtplib, sys, time
@@ -39,8 +39,6 @@ CFG = dict(
     piv_left=5, piv_right=5, orb_min=15, chop_crosses=3,
     cd_same=12, cd_opp=6,
 )
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")       # from @BotFather
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")   # your chat id
 EMAIL_FROM = os.getenv("EMAIL_FROM", "")               # e.g. your Gmail address
 EMAIL_APP_PASSWORD = os.getenv("EMAIL_APP_PASSWORD", "")  # Gmail "App password", not your login password
 EMAIL_TO = os.getenv("EMAIL_TO", "")
@@ -341,15 +339,6 @@ def format_event(e):
                 f"Option premium: check your broker (not auto-fetched).\nScore is a confluence rating, not a win probability.")
     return f"{e['kind']}\nNIFTY {e['strike']} {side}\nSpot: {e['spot']:.1f}\nP&L: {e['pnl']:+.1f} spot pts\nCandle close: {t} IST"
 
-def send_telegram(msg):
-    if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
-        return False
-    import requests
-    r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                      data={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=20)
-    r.raise_for_status()
-    return True
-
 def send_email(subject, msg):
     if not (EMAIL_FROM and EMAIL_APP_PASSWORD and EMAIL_TO):
         return False
@@ -362,13 +351,12 @@ def send_email(subject, msg):
     return True
 
 def notify(subject, msg):
-    sent = []
-    for name, fn in (("telegram", lambda: send_telegram(msg)), ("email", lambda: send_email(subject, msg))):
-        try:
-            if fn(): sent.append(name)
-        except Exception as ex:
-            print(f"[warn] {name} failed: {ex}")
-    print(f"[{datetime.now():%H:%M:%S}] {subject} -> sent via: {', '.join(sent) or 'NOTHING (configure Telegram/email)'}")
+    ok = False
+    try:
+        ok = send_email(subject, msg)
+    except Exception as ex:
+        print(f"[warn] email failed: {ex}")
+    print(f"[{pd.Timestamp.now(tz=TZ):%H:%M:%S} IST] {subject} -> {'email sent' if ok else 'NOT SENT (set EMAIL_FROM, EMAIL_APP_PASSWORD, EMAIL_TO)'}")
     print(msg, "\n")
 
 
@@ -388,7 +376,7 @@ def check_once(df=None):
         print("Not enough bars yet:", len(df)); return
     d = build(df)
     last_ts = d.index[-1]
-    print(f"[{datetime.now():%H:%M:%S}] latest closed bar: {last_ts:%d-%b %H:%M} close {d['close'].iloc[-1]:.1f}")
+    print(f"[{pd.Timestamp.now(tz=TZ):%H:%M:%S} IST] latest closed bar: {last_ts:%d-%b %H:%M} close {d['close'].iloc[-1]:.1f}")
     events = run_state(d)
     st = load_state()
     sent = st.get("sent", [])
