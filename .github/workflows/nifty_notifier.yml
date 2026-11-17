@@ -1,0 +1,39 @@
+name: NIFTY signal notifier
+
+on:
+  schedule:
+    # every 5 minutes, Mon-Fri, 03:45-10:15 UTC = 09:15-15:45 IST (the script itself re-checks market hours)
+    - cron: "*/5 3-10 * * 1-5"
+  workflow_dispatch: {}   # lets you press "Run workflow" manually to test
+
+concurrency:
+  group: nifty-notifier
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # remembers which signals were already sent (runners forget everything between runs)
+      - uses: actions/cache@v4
+        with:
+          path: notifier_state.json
+          key: notifier-state-${{ github.run_id }}
+          restore-keys: notifier-state-
+
+      - name: Check for signals
+        env:
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python nifty_notifier.py --once
