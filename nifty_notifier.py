@@ -397,7 +397,7 @@ def check_once(df=None):
 
 def market_open_now():
     now = datetime.now(pd.Timestamp.now(tz=TZ).tz)
-    return now.weekday() < 5 and OPEN_MIN <= now.hour * 60 + now.minute <= CLOSE_MIN + 1
+    return now.weekday() < 5 and OPEN_MIN <= now.hour * 60 + now.minute <= CLOSE_MIN + 10
 
 def main():
     ap = argparse.ArgumentParser()
@@ -412,7 +412,7 @@ def main():
         selftest(); return
     if a.once:
         if not market_open_now():
-            print("Market closed (Mon-Fri 09:15-15:30 IST) - nothing to do."); return
+            print(f"[{pd.Timestamp.now(tz=TZ):%a %d-%b %H:%M:%S} IST] Market closed (Mon-Fri 09:15-15:40 IST) - nothing to do."); return
         check_once(); return
     print("Running. Ctrl+C to stop. Checks every 5-minute candle close during market hours (Mon-Fri 09:15-15:30 IST).")
     while True:
