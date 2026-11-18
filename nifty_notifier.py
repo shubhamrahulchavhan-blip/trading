@@ -339,21 +339,91 @@ def format_event(e):
                 f"Option premium: check your broker (not auto-fetched).\nScore is a confluence rating, not a win probability.")
     return f"{e['kind']}\nNIFTY {e['strike']} {side}\nSpot: {e['spot']:.1f}\nP&L: {e['pnl']:+.1f} spot pts\nCandle close: {t} IST"
 
-def send_email(subject, msg):
+
+def format_html(e):
+    """Email-safe HTML (tables + inline styles, works in Gmail/Outlook/mobile)."""
+    t = e["ts"].strftime("%a %d %b, %H:%M")
+    side = "CE" if e["dir"] == 1 else "PE"
+    word = "CALL" if e["dir"] == 1 else "PUT"
+    FONT = "font-family:-apple-system,'Segoe UI',Roboto,Arial,sans-serif;"
+    if e["kind"] == "ENTRY":
+        col = "#0f9d58" if e["dir"] == 1 else "#d93025"
+        soft = "#e6f4ea" if e["dir"] == 1 else "#fce8e6"
+        risk, reward = abs(e["entry"] - e["sl"]), abs(e["tg"] - e["entry"])
+        rr = reward / risk if risk else 0
+        sc = e["score"]
+        bar = "#0f9d58" if sc >= 85 else "#f9ab00" if sc >= 75 else "#80868b"
+        def row(label, val, color="#202124", bold=True):
+            return (f'<tr><td style="padding:12px 16px;border-bottom:1px solid #eee;color:#5f6368;font-size:14px;{FONT}">{label}</td>'
+                    f'<td align="right" style="padding:12px 16px;border-bottom:1px solid #eee;font-size:17px;color:{color};'
+                    f'font-weight:{700 if bold else 400};{FONT}">{val}</td></tr>')
+        body = (row("Entry (spot)", f"{e['entry']:,.1f}") +
+                row("Target (spot)", f"{e['tg']:,.1f}", "#0f9d58") +
+                row("Stop-loss (spot)", f"{e['sl']:,.1f}", "#d93025") +
+                row("Risk : Reward", f"1 : {rr:.2f}") +
+                row("Risk / Reward (points)", f"{risk:.1f} / {reward:.1f}", "#202124", False))
+        return f"""<!doctype html><html><body style="margin:0;padding:0;background:#f1f3f4;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#f1f3f4;padding:24px 8px;"><tr><td align="center">
+<table width="480" cellpadding="0" cellspacing="0" style="max-width:480px;width:100%;background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.08);">
+<tr><td style="background:{col};padding:22px 24px;{FONT}">
+  <div style="color:#f1f3f4;font-size:12px;letter-spacing:1.5px;font-weight:600;">NEW SIGNAL &middot; BUY {word}</div>
+  <div style="color:#ffffff;font-size:28px;font-weight:800;margin-top:6px;">NIFTY {e['strike']} {side}</div>
+  <div style="color:#ffffff;font-size:13px;margin-top:6px;">Candle close {t} IST</div>
+</td></tr>
+<tr><td style="padding:18px 24px 6px 24px;{FONT}">
+  <div style="font-size:12px;color:#5f6368;letter-spacing:1px;font-weight:600;">CONFLUENCE SCORE</div>
+  <table width="100%" cellpadding="0" cellspacing="0" style="margin-top:8px;"><tr>
+    <td style="font-size:26px;font-weight:800;color:#202124;{FONT}" width="110">{sc}<span style="font-size:14px;color:#5f6368;font-weight:600;">/100</span></td>
+    <td><div style="background:#e8eaed;border-radius:6px;height:10px;"><div style="background:{bar};width:{sc}%;height:10px;border-radius:6px;"></div></div></td>
+    <td align="right" width="110" style="font-size:12px;font-weight:700;color:{bar};{FONT}">{grade(sc)}</td>
+  </tr></table>
+</td></tr>
+<tr><td style="padding:12px 24px 0 24px;"><table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #eee;border-radius:10px;overflow:hidden;background:#ffffff;">{body}</table></td></tr>
+<tr><td style="padding:16px 24px 6px 24px;{FONT}font-size:13px;color:#3c4043;line-height:1.5;">
+  <b>Check before you trade:</b> look up the live <b>{e['strike']} {side}</b> premium in your broker. Levels above are NIFTY <b>spot</b>, not option prices.
+</td></tr>
+<tr><td style="padding:14px 24px 22px 24px;{FONT}font-size:11px;color:#80868b;line-height:1.5;border-top:1px solid #f1f3f4;">
+  The score is a confluence rating, not a probability of winning. Educational tool, not investment advice. Options can lose their full premium quickly.
+</td></tr></table></td></tr></table></body></html>"""
+    # exits
+    k = e["kind"]
+    col = "#0f9d58" if k == "TARGET HIT" else "#d93025" if k == "STOP-LOSS HIT" else "#f9ab00"
+    pcol = "#0f9d58" if e["pnl"] >= 0 else "#d93025"
+    return f"""<!doctype html><html><body style="margin:0;padding:0;background:#f1f3f4;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#f1f3f4;padding:24px 8px;"><tr><td align="center">
+<table width="480" cellpadding="0" cellspacing="0" style="max-width:480px;width:100%;background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.08);">
+<tr><td style="background:{col};padding:22px 24px;{FONT}">
+  <div style="color:#f1f3f4;font-size:12px;letter-spacing:1.5px;font-weight:600;">TRADE UPDATE</div>
+  <div style="color:#ffffff;font-size:26px;font-weight:800;margin-top:6px;">{k}</div>
+  <div style="color:#ffffff;font-size:13px;margin-top:6px;">NIFTY {e['strike']} {side} &middot; {t} IST</div>
+</td></tr>
+<tr><td style="padding:20px 24px;{FONT}">
+  <table width="100%" cellpadding="0" cellspacing="0">
+    <tr><td style="color:#5f6368;font-size:14px;padding:8px 0;">Spot at exit</td><td align="right" style="font-size:17px;font-weight:700;color:#202124;">{e['spot']:,.1f}</td></tr>
+    <tr><td style="color:#5f6368;font-size:14px;padding:8px 0;border-top:1px solid #eee;">Result (spot points)</td><td align="right" style="font-size:20px;font-weight:800;color:{pcol};border-top:1px solid #eee;">{e['pnl']:+.1f}</td></tr>
+  </table>
+</td></tr>
+<tr><td style="padding:14px 24px 22px 24px;{FONT}font-size:11px;color:#80868b;line-height:1.5;border-top:1px solid #f1f3f4;">
+  Result is in NIFTY spot points and excludes costs and option-premium effects. Educational tool, not investment advice.
+</td></tr></table></td></tr></table></body></html>"""
+
+def send_email(subject, msg, html=None):
     if not (EMAIL_FROM and EMAIL_APP_PASSWORD and EMAIL_TO):
         return False
     m = EmailMessage()
     m["From"], m["To"], m["Subject"] = EMAIL_FROM, EMAIL_TO, subject
     m.set_content(msg)
+    if html:
+        m.add_alternative(html, subtype="html")
     with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30) as s:
         s.login(EMAIL_FROM, EMAIL_APP_PASSWORD)
         s.send_message(m)
     return True
 
-def notify(subject, msg):
+def notify(subject, msg, html=None):
     ok = False
     try:
-        ok = send_email(subject, msg)
+        ok = send_email(subject, msg, html)
     except Exception as ex:
         print(f"[warn] email failed: {ex}")
     print(f"[{pd.Timestamp.now(tz=TZ):%H:%M:%S} IST] {subject} -> {'email sent' if ok else 'NOT SENT (set EMAIL_FROM, EMAIL_APP_PASSWORD, EMAIL_TO)'}")
@@ -390,7 +460,7 @@ def check_once(df=None):
         if key in sent:
             continue
         subj = ("BUY NIFTY %d %s" % (e["strike"], "CE" if e["dir"] == 1 else "PE")) if e["kind"] == "ENTRY" else e["kind"]
-        notify(subj, format_event(e))
+        notify(subj, format_event(e), format_html(e))
         sent.append(key)
         st["sent"] = sent[-50:]
         save_state(st)
