@@ -2,8 +2,10 @@ name: NIFTY signal notifier
 
 on:
   schedule:
-    # every 5 minutes, Mon-Fri, 03:45-10:15 UTC = 09:15-15:45 IST (the script itself re-checks market hours)
-    - cron: "*/5 3-10 * * 1-5"
+    # GitHub cron is UTC only. IST = UTC + 5:30. These three lines = 09:15-15:35 IST, Mon-Fri.
+    - cron: "45-59/5 3 * * 1-5"   # 03:45-03:55 UTC = 09:15-09:25 IST
+    - cron: "*/5 4-9 * * 1-5"     # 04:00-09:55 UTC = 09:30-15:25 IST
+    - cron: "0-5/5 10 * * 1-5"    # 10:00-10:05 UTC = 15:30-15:35 IST
   workflow_dispatch: {}   # lets you press "Run workflow" manually to test
 
 concurrency:
@@ -21,6 +23,11 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+
+      - name: Show current time (UTC and IST)
+        run: |
+          echo "UTC: $(date -u '+%a %d-%b %H:%M:%S')"
+          echo "IST: $(TZ=Asia/Kolkata date '+%a %d-%b %H:%M:%S')"
 
       - run: pip install -r requirements.txt
 
