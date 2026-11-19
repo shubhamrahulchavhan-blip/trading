@@ -2,10 +2,12 @@ name: NIFTY signal notifier
 
 on:
   schedule:
-    # GitHub cron is always UTC. NSE 09:15-15:30 IST = 03:45-10:00 UTC, Mon-Fri.
-    - cron: "45,50,55 3 * * 1-5"
-    - cron: "*/5 4-9 * * 1-5"
-    - cron: "0 10 * * 1-5"
+    # GitHub cron is UTC. IST = UTC + 5:30. NSE 09:15-15:30 IST, Mon-Fri.
+    # Minutes are offset (:02, :07, ...) because :00/:05 are the busiest and
+    # most delayed; it also lets the 5-minute candle fully close before the run.
+    - cron: "47,52,57 3 * * 1-5"   # 09:17, 09:22, 09:27 IST
+    - cron: "2-59/5 4-9 * * 1-5"   # 09:32 to 15:27 IST, every 5 min
+    - cron: "2 10 * * 1-5"         # 15:32 IST (last candle)
   workflow_dispatch:
 
 concurrency:
@@ -38,8 +40,8 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # Caches are immutable: a fixed key is saved once and never updated.
-      # So every run saves under a NEW key and restores the newest older one.
+      # Caches are immutable, so every run saves under a NEW key
+      # and restores the newest older one.
       - name: Restore notifier state
         uses: actions/cache/restore@v4
         with:
@@ -55,7 +57,7 @@ jobs:
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
         run: python nifty_notifier.py --once
 
-      # Save even if the script failed, so already-sent signals are not re-sent.
+      # Save even if the script failed, so sent signals are not re-sent.
       - name: Save notifier state
         if: always()
         uses: actions/cache/save@v4
