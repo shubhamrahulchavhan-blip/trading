@@ -1,22 +1,32 @@
 #!/usr/bin/env python3
 """
-NIFTY intraday signal notifier (free alternative to TradingView alerts).
+NIFTY intraday signal notifier (free alternative to TradingView alerts)  -  v2
 
-A Python port of nifty_intraday_signals.pine. It polls 5-minute NIFTY data, evaluates the
-same gates / setups / weighted score on CLOSED candles only, and sends an email
-when a BUY CE / BUY PE signal or an exit (target, stop-loss, opposite, time) occurs.
+A Python port of the NIFTY Intraday Signal Engine (Pine strategy v2). It polls 5-minute
+NIFTY data, evaluates the same gates / setups / weighted score on CLOSED candles only,
+and sends an email when a BUY CE / BUY PE signal or a trade event occurs
+(breakeven-stop move, target, stop-loss, opposite signal, time square-off).
+
+v2 rules ported from the Pine strategy
+- Breakeven shift: after +1R (closed bar) the stop moves to entry + 0.1R, from the NEXT bar.
+  You get an email "MOVE STOP TO BREAKEVEN" - move your stop manually.
+- Stop trading for the day after 2 consecutive losing trades.
+- No new entries inside the square-off window; the session's last bar always flattens.
+- Yahoo download retries (cloud IPs are sometimes rate-limited).
 
 Notes
-- It is a port, so small differences from the TradingView indicator are possible.
+- It is a port, so small differences from TradingView are possible.
 - Data comes from Yahoo Finance (^NSEI). Index data has no volume, so the volume filter is
   off and VWAP is a session average price (same fallback as the Pine script). Yahoo can be
   delayed or have gaps - check the printed "latest bar" time against your broker/chart.
 - Option premiums are NOT fetched or invented. Messages give the strike and SPOT levels.
 - Educational tool, not investment advice.
 
-Setup:  pip install yfinance pandas numpy requests
+Setup:  pip install yfinance pandas numpy
 Run:    python nifty_notifier.py --test      (sends a test email)
-        python nifty_notifier.py             (runs during market hours)
+        python nifty_notifier.py --once      (one check, used by GitHub Actions)
+        python nifty_notifier.py             (loops during market hours)
+        python nifty_notifier.py --selftest  (synthetic data, no network, no email)
 """
 import argparse, json, os, smtplib, sys, time
 from datetime import datetime, timedelta
@@ -38,6 +48,10 @@ CFG = dict(
     spike_mult=2.5, ext_mult=2.0, brk_look=3, pb_tol=0.25,
     piv_left=5, piv_right=5, orb_min=15, chop_crosses=3,
     cd_same=12, cd_opp=6,
+    # v2 additions
+    use_be=True, be_trig_r=1.0, be_lock_r=0.1,   # breakeven shift
+    max_cons_loss=2,                              # stop for the day after N consecutive losses (0 = off)
+    bar_minutes=5,
 )
 EMAIL_FROM = os.getenv("EMAIL_FROM", "")               # e.g. your Gmail address
 EMAIL_APP_PASSWORD = os.getenv("EMAIL_APP_PASSWORD", "")  # Gmail "App password", not your login password
@@ -96,9 +110,17 @@ def supertrend(h, l, c, factor=3.0, n=10):
 
 
 # ───────────────────────────── data ─────────────────────────────
-def fetch_5m():
+def fetch_5m(retries=3):
     import yfinance as yf
-    df = yf.download(CFG["symbol"], period="10d", interval="5m", progress=False, auto_adjust=False)
+    df = None
+    for attempt in range(retries):
+        try:
+            df = yf.download(CFG["symbol"], period="10d", interval="5m", progress=False, auto_adjust=False)
+            if df is not None and not df.empty:
+                break
+        except Exception as ex:
+            print(f"[warn] yahoo attempt {attempt + 1}/{retries} failed: {ex}")
+        time.sleep(5 * (attempt + 1))
     if df is None or df.empty:
         raise RuntimeError("No data returned from Yahoo Finance")
     if isinstance(df.columns, pd.MultiIndex):
@@ -108,7 +130,7 @@ def fetch_5m():
     df.index = idx.tz_localize("UTC").tz_convert(TZ) if idx.tz is None else idx.tz_convert(TZ)
     # drop the still-forming candle
     now = datetime.now(df.index.tz)
-    if len(df) and df.index[-1] + timedelta(minutes=5) > now:
+    if len(df) and df.index[-1] + timedelta(minutes=CFG["bar_minutes"]) > now:
         df = df.iloc[:-1]
     return df
 
@@ -267,7 +289,9 @@ def score_and_signals(d):
     score_e = np.minimum(100, np.round(se / maxw * 100)).astype(int)
 
     m = A["mod"]
-    trade_win = (m >= OPEN_MIN + c["no_trade_open_min"]) & (m < CLOSE_MIN - c["no_entry_close_min"])
+    # v2: no new entries inside the square-off window either
+    entry_cut = CLOSE_MIN - max(c["no_entry_close_min"], c["square_off_min"])
+    trade_win = (m >= OPEN_MIN + c["no_trade_open_min"]) & (m < entry_cut)
     core_b = (cl > vw) & (A["e9"] > A["e21"]) & (A["st"] < 0) & (adx >= c["adx_min"]) & (dip > dim) & (hc > h21)
     core_e = (cl < vw) & (A["e9"] < A["e21"]) & (A["st"] > 0) & (adx >= c["adx_min"]) & (dim > dip) & (hc < h21)
     ok = ~sideways & ~chop & vol_ok & ~spike & ~np.isnan(hc) & ~np.isnan(A["pdh"])
@@ -277,37 +301,66 @@ def score_and_signals(d):
 
 
 def run_state(d):
-    """Replays the Pine trade state machine; returns a list of events with bar index."""
+    """Replays the Pine v2 trade state machine; returns a list of events with bar index."""
     c = CFG
     buy, sell, sb, se, A, date = score_and_signals(d)
     n = len(d)
     ts = d.index
     atm = lambda px: int(round(px / c["strike_interval"]) * c["strike_interval"])
     steps = {"ATM": 0, "ITM 1": 1, "ITM 2": 2, "OTM 1": -1}[c["strike_mode"]]
+    sess_end = (A["mod"] + c["bar_minutes"]) >= CLOSE_MIN       # the session's last bar always flattens
     events = []
     pos = 0; entry = sl = tg = np.nan; ebar = 0; strike = 0; tscore = 0
+    risk_pts = np.nan; be_done = False; cons_loss = 0
     trades = 0; day_pnl = 0.0; last_entry = -10**6; last_dir = 0; cur_date = None
     for i in range(n):
         if date[i] != cur_date:
-            cur_date = date[i]; trades = 0; day_pnl = 0.0; last_entry = -10**6; last_dir = 0; pos = 0
+            cur_date = date[i]; trades = 0; day_pnl = 0.0; last_entry = -10**6; last_dir = 0; pos = 0; cons_loss = 0
         flat_start = pos == 0
         exited = False
-        if pos != 0 and i > ebar:
-            hit_sl = A["low"][i] <= sl if pos == 1 else A["high"][i] >= sl
-            hit_tg = A["high"][i] >= tg if pos == 1 else A["low"][i] <= tg
-            opp = (pos == 1 and sell[i]) or (pos == -1 and buy[i])
-            tm = A["mod"][i] >= CLOSE_MIN - c["square_off_min"] or (c["max_hold"] > 0 and i - ebar >= c["max_hold"])
+
+        # ---- exits (from the bar AFTER entry; the session's last bar always flattens) ----
+        if pos != 0 and (i > ebar or sess_end[i]):
+            same = i == ebar
+            if pos == 1:
+                hit_sl = (not same) and A["low"][i] <= sl
+                hit_tg = (not same) and A["high"][i] >= tg
+            else:
+                hit_sl = (not same) and A["high"][i] >= sl
+                hit_tg = (not same) and A["low"][i] <= tg
+            opp = (not same) and ((pos == 1 and sell[i]) or (pos == -1 and buy[i]))
+            tm = bool(sess_end[i]) or A["mod"][i] >= CLOSE_MIN - c["square_off_min"] or (c["max_hold"] > 0 and i - ebar >= c["max_hold"])
             kind = None
-            if hit_sl: kind, px = "STOP-LOSS HIT", sl
-            elif hit_tg: kind, px = "TARGET HIT", tg
-            elif c["exit_on_opposite"] and opp: kind, px = "EXIT: opposite signal", A["close"][i]
-            elif tm: kind, px = "EXIT: time / square-off", A["close"][i]
+            if hit_sl:
+                kind, px = ("BREAKEVEN STOP" if be_done else "STOP-LOSS HIT"), sl
+            elif hit_tg:
+                kind, px = "TARGET HIT", tg
+            elif c["exit_on_opposite"] and opp:
+                kind, px = "EXIT: opposite signal", A["close"][i]
+            elif tm:
+                kind, px = "EXIT: time / square-off", A["close"][i]
             if kind:
                 pnl = (px - entry) * pos
                 day_pnl += pnl
+                cons_loss = cons_loss + 1 if pnl < 0 else 0
                 events.append(dict(i=i, ts=ts[i], kind=kind, dir=pos, strike=strike, pnl=pnl, spot=A["close"][i]))
                 pos = 0; exited = True
-        can = flat_start and not exited and trades < c["max_trades"] and day_pnl > -c["max_loss_pts"]
+
+        # ---- breakeven shift: once +be_trig_r is reached on a closed bar, stop moves from the NEXT bar ----
+        if c["use_be"] and pos != 0 and not be_done and i > ebar and not exited:
+            if pos == 1:
+                reached = A["high"][i] >= entry + risk_pts * c["be_trig_r"]
+            else:
+                reached = A["low"][i] <= entry - risk_pts * c["be_trig_r"]
+            if reached:
+                sl = entry + pos * risk_pts * c["be_lock_r"]
+                be_done = True
+                events.append(dict(i=i, ts=ts[i], kind="MOVE STOP TO BREAKEVEN", dir=pos, strike=strike,
+                                   entry=entry, sl=sl, tg=tg, spot=A["close"][i]))
+
+        # ---- entries ----
+        can = (flat_start and not exited and trades < c["max_trades"] and day_pnl > -c["max_loss_pts"]
+               and (c["max_cons_loss"] == 0 or cons_loss < c["max_cons_loss"]))
         cd_b = (i - last_entry) >= (c["cd_same"] if last_dir == 1 else c["cd_opp"])
         cd_e = (i - last_entry) >= (c["cd_same"] if last_dir == -1 else c["cd_opp"])
         enter = 0
@@ -316,6 +369,7 @@ def run_state(d):
         if enter:
             risk = max(A["atr"][i] * c["sl_atr_mult"], c["min_risk_pts"])
             pos = enter; entry = A["close"][i]; ebar = i
+            risk_pts = risk; be_done = False
             sl = entry - risk * enter; tg = entry + risk * c["rr"] * enter
             strike = atm(entry) - steps * c["strike_interval"] if enter == 1 else atm(entry) + steps * c["strike_interval"]
             tscore = int(sb[i] if enter == 1 else se[i])
@@ -337,6 +391,10 @@ def format_event(e):
                 f"Spot entry: {e['entry']:.1f}\nTarget (spot): {e['tg']:.1f}\nStop-loss (spot): {e['sl']:.1f}\n"
                 f"Score: {e['score']}/100 ({grade(e['score'])})\nCandle close: {t} IST\n"
                 f"Option premium: check your broker (not auto-fetched).\nScore is a confluence rating, not a win probability.")
+    if e["kind"] == "MOVE STOP TO BREAKEVEN":
+        return (f"MOVE STOP TO BREAKEVEN\nNIFTY {e['strike']} {side}\n"
+                f"New spot stop-loss: {e['sl']:.1f} (entry {e['entry']:.1f})\nTarget unchanged: {e['tg']:.1f}\n"
+                f"Spot now: {e['spot']:.1f}\nCandle close: {t} IST\nMove your stop manually in your broker.")
     return f"{e['kind']}\nNIFTY {e['strike']} {side}\nSpot: {e['spot']:.1f}\nP&L: {e['pnl']:+.1f} spot pts\nCandle close: {t} IST"
 
 
@@ -348,7 +406,6 @@ def format_html(e):
     FONT = "font-family:-apple-system,'Segoe UI',Roboto,Arial,sans-serif;"
     if e["kind"] == "ENTRY":
         col = "#0f9d58" if e["dir"] == 1 else "#d93025"
-        soft = "#e6f4ea" if e["dir"] == 1 else "#fce8e6"
         risk, reward = abs(e["entry"] - e["sl"]), abs(e["tg"] - e["entry"])
         rr = reward / risk if risk else 0
         sc = e["score"]
@@ -384,6 +441,26 @@ def format_html(e):
 </td></tr>
 <tr><td style="padding:14px 24px 22px 24px;{FONT}font-size:11px;color:#80868b;line-height:1.5;border-top:1px solid #f1f3f4;">
   The score is a confluence rating, not a probability of winning. Educational tool, not investment advice. Options can lose their full premium quickly.
+</td></tr></table></td></tr></table></body></html>"""
+    if e["kind"] == "MOVE STOP TO BREAKEVEN":
+        return f"""<!doctype html><html><body style="margin:0;padding:0;background:#f1f3f4;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#f1f3f4;padding:24px 8px;"><tr><td align="center">
+<table width="480" cellpadding="0" cellspacing="0" style="max-width:480px;width:100%;background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.08);">
+<tr><td style="background:#1a73e8;padding:22px 24px;{FONT}">
+  <div style="color:#f1f3f4;font-size:12px;letter-spacing:1.5px;font-weight:600;">TRADE UPDATE &middot; ACTION NEEDED</div>
+  <div style="color:#ffffff;font-size:24px;font-weight:800;margin-top:6px;">Move stop to breakeven</div>
+  <div style="color:#ffffff;font-size:13px;margin-top:6px;">NIFTY {e['strike']} {side} &middot; {t} IST</div>
+</td></tr>
+<tr><td style="padding:20px 24px;{FONT}">
+  <table width="100%" cellpadding="0" cellspacing="0">
+    <tr><td style="color:#5f6368;font-size:14px;padding:8px 0;">New stop-loss (spot)</td><td align="right" style="font-size:20px;font-weight:800;color:#d93025;">{e['sl']:,.1f}</td></tr>
+    <tr><td style="color:#5f6368;font-size:14px;padding:8px 0;border-top:1px solid #eee;">Entry (spot)</td><td align="right" style="font-size:16px;font-weight:700;color:#202124;border-top:1px solid #eee;">{e['entry']:,.1f}</td></tr>
+    <tr><td style="color:#5f6368;font-size:14px;padding:8px 0;border-top:1px solid #eee;">Target (spot), unchanged</td><td align="right" style="font-size:16px;font-weight:700;color:#0f9d58;border-top:1px solid #eee;">{e['tg']:,.1f}</td></tr>
+    <tr><td style="color:#5f6368;font-size:14px;padding:8px 0;border-top:1px solid #eee;">Spot now</td><td align="right" style="font-size:16px;font-weight:700;color:#202124;border-top:1px solid #eee;">{e['spot']:,.1f}</td></tr>
+  </table>
+</td></tr>
+<tr><td style="padding:14px 24px 22px 24px;{FONT}font-size:11px;color:#80868b;line-height:1.5;border-top:1px solid #f1f3f4;">
+  Move the stop manually in your broker. Levels are NIFTY spot, not option prices. Educational tool, not investment advice.
 </td></tr></table></td></tr></table></body></html>"""
     # exits
     k = e["kind"]
