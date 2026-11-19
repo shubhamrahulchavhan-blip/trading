@@ -2,10 +2,10 @@ name: NIFTY signal notifier
 
 on:
   schedule:
-    - cron: "45-59/5 3 * * 1-5" # 09:15, 09:20, 09:25 IST
-    - cron: "*/5 4-9 * * 1-5"   # 09:30–15:25 IST, every 5 minutes
-    - cron: "0-5/5 10 * * 1-5"  # 15:30, 15:35 IST
-  workflow_dispatch: {}   # lets you press "Run workflow" manually to test
+    - cron: "45-59/5 3 * * 1-5"  # 09:15–09:25 IST
+    - cron: "*/5 4-9 * * 1-5"    # 09:30–15:25 IST
+    - cron: "0 10 * * 1-5"       # 15:30 IST
+  workflow_dispatch:
 
 concurrency:
   group: nifty-notifier
@@ -15,29 +15,34 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
 
-      - name: Show current time (UTC and IST)
+      - name: Show current UTC and IST time
         run: |
-          echo "UTC: $(date -u '+%a %d-%b %H:%M:%S')"
-          echo "IST: $(TZ=Asia/Kolkata date '+%a %d-%b %H:%M:%S')"
+          echo "UTC: $(date -u '+%a %d-%b %Y %H:%M:%S')"
+          echo "IST: $(TZ=Asia/Kolkata date '+%a %d-%b %Y %H:%M:%S')"
 
-      - run: pip install -r requirements.txt
+      - name: Install dependencies
+        run: pip install -r requirements.txt
 
-      # remembers which signals were already sent (runners forget everything between runs)
-      - uses: actions/cache@v4
+      - name: Restore notifier state
+        uses: actions/cache@v4
         with:
           path: notifier_state.json
-          key: notifier-state-${{ github.run_id }}
-          restore-keys: notifier-state-
+          key: nifty-notifier-state
+          restore-keys: |
+            nifty-notifier-state-
 
-      - name: Check for signals
+      - name: Check for NIFTY signals
         env:
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
