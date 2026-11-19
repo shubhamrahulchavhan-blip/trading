@@ -2,10 +2,8 @@ name: NIFTY signal notifier
 
 on:
   schedule:
-    - cron: "45-59/5 3 * * 1-5" # 09:15–09:25 IST
-    - cron: "*/5 4-9 * * 1-5"   # 09:30–15:25 IST
-    - cron: "0 10 * * 1-5"      # 15:30 IST
-  workflow_dispatch:
+    - cron: "*/5 * * * *"
+     workflow_dispatch:
 
 concurrency:
   group: nifty-notifier
