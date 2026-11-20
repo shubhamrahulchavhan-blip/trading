@@ -1,0 +1,78 @@
+name: NIFTY signal notifier
+
+on:
+  schedule:
+    # GitHub cron is UTC (IST = UTC + 5:30).
+    # The runs cover 09:17-15:32 IST, Monday-Friday.
+    - cron: "47,52,57 3 * * 1-5"
+    - cron: "2-59/5 4-9 * * 1-5"
+    - cron: "2 10 * * 1-5"
+  workflow_dispatch:
+
+concurrency:
+  group: nifty-notifier
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Market-hours gate (IST)
+        id: gate
+        run: |
+          DOW=$(TZ=Asia/Kolkata date +%u)
+          HM=$((10#$(TZ=Asia/Kolkata date +%H%M)))
+
+          echo "IST: $(TZ=Asia/Kolkata date '+%a %d-%b-%Y %H:%M:%S')"
+          echo "UTC: $(date -u '+%a %d-%b-%Y %H:%M:%S')"
+
+          if [ "$DOW" -le 5 ] && [ "$HM" -ge 915 ] && [ "$HM" -le 1540 ]; then
+            echo "open=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "open=false" >> "$GITHUB_OUTPUT"
+            echo "Outside market hours - skipping."
+          fi
+
+      - name: Checkout repository
+        if: steps.gate.outputs.open == 'true'
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        if: steps.gate.outputs.open == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        if: steps.gate.outputs.open == 'true'
+        run: pip install -r requirements.txt
+
+      - name: Restore notifier state
+        if: steps.gate.outputs.open == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: notifier_state.json
+          key: nifty-notifier-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            nifty-notifier-state-
+
+      - name: Check for NIFTY signals
+        if: steps.gate.outputs.open == 'true'
+        env:
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python nifty_notifier.py --once
+
+      - name: Save notifier state
+        if: always() && steps.gate.outputs.open == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: notifier_state.json
+          key: nifty-notifier-state-${{ github.run_id }}-${{ github.run_attempt }}
