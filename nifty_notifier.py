@@ -551,6 +551,7 @@ def main():
     ap.add_argument("--test", action="store_true", help="send a test notification and exit")
     ap.add_argument("--once", action="store_true", help="check once and exit")
     ap.add_argument("--selftest", action="store_true", help="run engine on synthetic data (no network, no sending)")
+    ap.add_argument("--ignore-market", action="store_true", help="with --once: run even outside market hours")
     a = ap.parse_args()
     if a.test:
         notify("NIFTY notifier test", "Test message from nifty_notifier.py. If you can read this, notifications work.")
@@ -558,7 +559,7 @@ def main():
     if a.selftest:
         selftest(); return
     if a.once:
-        if not market_open_now():
+        if not a.ignore_market and not market_open_now():
             print(f"[{pd.Timestamp.now(tz=TZ):%a %d-%b %H:%M:%S} IST] Market closed (Mon-Fri 09:15-15:40 IST) - nothing to do."); return
         check_once(); return
     print("Running. Ctrl+C to stop. Checks every 5-minute candle close during market hours (Mon-Fri 09:15-15:30 IST).")
