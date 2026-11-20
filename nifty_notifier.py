@@ -1,13 +1,24 @@
 #!/usr/bin/env python3
 """
-NIFTY intraday signal notifier (free alternative to TradingView alerts)  -  v2
+NIFTY intraday signal notifier (free alternative to TradingView alerts)  -  v3, 15-MINUTE EDITION
 
-A Python port of the NIFTY Intraday Signal Engine (Pine strategy v2). It polls 5-minute
-NIFTY data, evaluates the same gates / setups / weighted score on CLOSED candles only,
-and sends an email when a BUY CE / BUY PE signal or a trade event occurs
-(breakeven-stop move, target, stop-loss, opposite signal, time square-off).
+A Python port of the NIFTY Intraday Signal Engine. It polls 15-minute NIFTY data, evaluates the
+same gates / setups / weighted score on CLOSED candles only, and sends an email when a
+BUY CE / BUY PE signal or a trade event occurs (breakeven-stop move, target, stop-loss,
+opposite signal, time square-off).
 
-v2 rules ported from the Pine strategy
+What changed from the 5-minute version
+- bar_minutes = 15 (Yahoo interval "15m", 30-day download so the 60m EMA50 warms up).
+- Confirmation timeframe is now 60m (15m confirmation on a 15m chart would be meaningless).
+- Tunables that were counted in bars are now defined in MINUTES and converted to bars, so
+  changing bar_minutes rescales cooldowns, breakout window, swing pivots and the VWAP-chop window.
+- Time exits use the bar CLOSE time (a 15m bar starting 15:15 closes at 15:30, so the old
+  start-time test would have squared off too late).
+- A breakout from the previous session can no longer carry into the next morning.
+- Price-based defaults rescaled for 15m ranges (min risk 25 pts, daily loss 150 pts, ORB 30 min).
+- Event look-back window scales with the bar size, so a delayed cloud run does not miss a signal.
+
+Rules ported from the Pine strategy
 - Breakeven shift: after +1R (closed bar) the stop moves to entry + 0.1R, from the NEXT bar.
   You get an email "MOVE STOP TO BREAKEVEN" - move your stop manually.
 - Stop trading for the day after 2 consecutive losing trades.
@@ -20,13 +31,13 @@ Notes
   off and VWAP is a session average price (same fallback as the Pine script). Yahoo can be
   delayed or have gaps - check the printed "latest bar" time against your broker/chart.
 - Option premiums are NOT fetched or invented. Messages give the strike and SPOT levels.
-- Educational tool, not investment advice.
+- The defaults are not validated by a backtest. Educational tool, not investment advice.
 
 Setup:  pip install yfinance pandas numpy
-Run:    python nifty_notifier.py --test      (sends a test email)
-        python nifty_notifier.py --once      (one check, used by GitHub Actions)
-        python nifty_notifier.py             (loops during market hours)
-        python nifty_notifier.py --selftest  (synthetic data, no network, no email)
+Run:    python nifty_notifier_15m.py --test      (sends a test email)
+        python nifty_notifier_15m.py --once      (one check, used by GitHub Actions)
+        python nifty_notifier_15m.py             (loops during market hours)
+        python nifty_notifier_15m.py --selftest  (synthetic data, no network, no email)
 """
 import argparse, json, os, smtplib, sys, time
 from datetime import datetime, timedelta
@@ -38,21 +49,39 @@ import pandas as pd
 # ───────────────────────────── CONFIG (edit here or use env vars) ─────────────────────────────
 CFG = dict(
     symbol="^NSEI",
+    bar_minutes=15,             # chart timeframe in minutes (5 and 15 are supported by Yahoo)
+    htf_minutes=60,             # confirmation timeframe, must be a multiple of bar_minutes
     strike_interval=50,
     strike_mode="ATM",          # ATM, ITM 1, ITM 2, OTM 1
     min_score=75, strong_score=85, adx_min=20.0,
-    sl_atr_mult=1.2, rr=1.5, min_risk_pts=10.0,
-    max_trades=3, max_loss_pts=75.0,
-    no_trade_open_min=15, no_entry_close_min=30, square_off_min=15, max_hold=0,
+    sl_atr_mult=1.2, rr=1.5, min_risk_pts=25.0,
+    max_trades=3, max_loss_pts=150.0,
+    no_trade_open_min=30, no_entry_close_min=30, square_off_min=15, max_hold=0,   # max_hold is in BARS
     exit_on_opposite=True,
-    spike_mult=2.5, ext_mult=2.0, brk_look=3, pb_tol=0.25,
-    piv_left=5, piv_right=5, orb_min=15, chop_crosses=3,
-    cd_same=12, cd_opp=6,
-    # v2 additions
-    use_be=True, be_trig_r=1.0, be_lock_r=0.1,   # breakeven shift
-    max_cons_loss=2,                              # stop for the day after N consecutive losses (0 = off)
-    bar_minutes=5,
+    spike_mult=2.5, ext_mult=2.0, pb_tol=0.25,
+    orb_min=30, chop_crosses=3,
+    # time-based settings, in MINUTES (converted to bars below)
+    brk_look_min=45,            # breakout stays valid
+    piv_min=45,                 # swing pivot width each side (confirmation delay)
+    chop_window_min=90,         # VWAP-chop look-back window
+    cd_same_min=60,             # cooldown, same direction as last trade
+    cd_opp_min=30,              # cooldown, opposite direction
+    # breakeven shift and loss streak
+    use_be=True, be_trig_r=1.0, be_lock_r=0.1,
+    max_cons_loss=2,            # stop for the day after N consecutive losses (0 = off)
 )
+
+
+def _bars(minutes, floor=1):
+    return max(floor, int(round(minutes / CFG["bar_minutes"])))
+
+
+CFG["brk_look"] = _bars(CFG["brk_look_min"])
+CFG["piv_left"] = CFG["piv_right"] = _bars(CFG["piv_min"], floor=2)
+CFG["chop_window"] = _bars(CFG["chop_window_min"], floor=2)
+CFG["cd_same"] = _bars(CFG["cd_same_min"])
+CFG["cd_opp"] = _bars(CFG["cd_opp_min"])
+
 EMAIL_FROM = os.getenv("EMAIL_FROM", "")               # e.g. your Gmail address
 EMAIL_APP_PASSWORD = os.getenv("EMAIL_APP_PASSWORD", "")  # Gmail "App password", not your login password
 EMAIL_TO = os.getenv("EMAIL_TO", "")
@@ -110,12 +139,14 @@ def supertrend(h, l, c, factor=3.0, n=10):
 
 
 # ───────────────────────────── data ─────────────────────────────
-def fetch_5m(retries=3):
+def fetch_bars(retries=3):
     import yfinance as yf
+    bm = CFG["bar_minutes"]
+    period = {5: "10d", 15: "30d"}.get(bm, "30d")      # Yahoo allows up to 60d for 15m data
     df = None
     for attempt in range(retries):
         try:
-            df = yf.download(CFG["symbol"], period="10d", interval="5m", progress=False, auto_adjust=False)
+            df = yf.download(CFG["symbol"], period=period, interval=f"{bm}m", progress=False, auto_adjust=False)
             if df is not None and not df.empty:
                 break
         except Exception as ex:
@@ -130,7 +161,7 @@ def fetch_5m(retries=3):
     df.index = idx.tz_localize("UTC").tz_convert(TZ) if idx.tz is None else idx.tz_convert(TZ)
     # drop the still-forming candle
     now = datetime.now(df.index.tz)
-    if len(df) and df.index[-1] + timedelta(minutes=CFG["bar_minutes"]) > now:
+    if len(df) and df.index[-1] + timedelta(minutes=bm) > now:
         df = df.iloc[:-1]
     return df
 
@@ -164,11 +195,12 @@ def build(df):
     d["vwap"] = np.where(vv > 0, pv / vv.replace(0, np.nan), avg)
     d["volsma"] = volsma
 
-    # higher timeframe: previous COMPLETED 15m bar (matches Pine [1] + lookahead_off)
-    h15 = C.resample("15min", origin="start_day", offset="9h15min", label="left", closed="left").last().dropna()
-    h15df = pd.DataFrame({"c": h15, "e21": ema(h15, 21), "e50": ema(h15, 50)}).shift(1)
-    h15df = h15df.reindex(d.index, method="ffill")
-    d["htfc"], d["htfe21"], d["htfe50"] = h15df["c"], h15df["e21"], h15df["e50"]
+    # higher timeframe: previous COMPLETED HTF bar (matches Pine [1] + lookahead_on)
+    htf = C.resample(f"{c['htf_minutes']}min", origin="start_day", offset="9h15min",
+                     label="left", closed="left").last().dropna()
+    htfdf = pd.DataFrame({"c": htf, "e21": ema(htf, 21), "e50": ema(htf, 50)}).shift(1)
+    htfdf = htfdf.reindex(d.index, method="ffill")
+    d["htfc"], d["htfe21"], d["htfe50"] = htfdf["c"], htfdf["e21"], htfdf["e50"]
 
     # previous day levels
     daily = d.groupby("date").agg(h=("high", "max"), l=("low", "min"), c=("close", "last"))
@@ -190,6 +222,7 @@ def build(df):
 
 def score_and_signals(d):
     c = CFG
+    bm = c["bar_minutes"]
     n = len(d)
     A = {k: d[k].values for k in ["open", "high", "low", "close", "e9", "e21", "e50", "rsi", "macd", "macds", "macdh",
                                   "st", "dip", "dim", "adx", "atr", "vwap", "htfc", "htfe21", "htfe50", "pdh", "pdl",
@@ -217,7 +250,8 @@ def score_and_signals(d):
     above = cl > vw
     crossf = np.zeros(n)
     crossf[1:] = (above[1:] != above[:-1]).astype(float)
-    chop = (pd.Series(crossf).rolling(10).sum().fillna(0).values >= c["chop_crosses"])
+    cw = c["chop_window"]
+    chop = (pd.Series(crossf).rolling(cw).sum().fillna(0).values >= c["chop_crosses"])
     sideways = (A["adx"] < c["adx_min"]) | ((A["adx"] < c["adx_min"] + 5) & (A["bbw"] < A["bbwavg"]))
     vol_ok = (A["volume"] >= A["volsma"]) if use_vol else np.ones(n, bool)
 
@@ -239,9 +273,14 @@ def score_and_signals(d):
     bbq, brq = brk_bull & bull_q, brk_bear & bear_q
 
     def recent(flag):
+        # a breakout only counts if it happened TODAY and within the validity window
         out = np.zeros(n, bool)
         last = -10**6
+        prev_d = None
         for i in range(n):
+            if date[i] != prev_d:
+                prev_d = date[i]
+                last = -10**6
             if flag[i]:
                 last = i
             out[i] = (i - last) <= c["brk_look"]
@@ -289,9 +328,10 @@ def score_and_signals(d):
     score_e = np.minimum(100, np.round(se / maxw * 100)).astype(int)
 
     m = A["mod"]
-    # v2: no new entries inside the square-off window either
+    m_end = m + bm                                            # bar CLOSE time in minutes
+    # no new entries inside the square-off window either; test on the bar CLOSE
     entry_cut = CLOSE_MIN - max(c["no_entry_close_min"], c["square_off_min"])
-    trade_win = (m >= OPEN_MIN + c["no_trade_open_min"]) & (m < entry_cut)
+    trade_win = (m >= OPEN_MIN + c["no_trade_open_min"]) & (m_end <= entry_cut)
     core_b = (cl > vw) & (A["e9"] > A["e21"]) & (A["st"] < 0) & (adx >= c["adx_min"]) & (dip > dim) & (hc > h21)
     core_e = (cl < vw) & (A["e9"] < A["e21"]) & (A["st"] > 0) & (adx >= c["adx_min"]) & (dim > dip) & (hc < h21)
     ok = ~sideways & ~chop & vol_ok & ~spike & ~np.isnan(hc) & ~np.isnan(A["pdh"])
@@ -301,14 +341,16 @@ def score_and_signals(d):
 
 
 def run_state(d):
-    """Replays the Pine v2 trade state machine; returns a list of events with bar index."""
+    """Replays the Pine trade state machine; returns a list of events with bar index."""
     c = CFG
+    bm = c["bar_minutes"]
     buy, sell, sb, se, A, date = score_and_signals(d)
     n = len(d)
     ts = d.index
     atm = lambda px: int(round(px / c["strike_interval"]) * c["strike_interval"])
     steps = {"ATM": 0, "ITM 1": 1, "ITM 2": 2, "OTM 1": -1}[c["strike_mode"]]
-    sess_end = (A["mod"] + c["bar_minutes"]) >= CLOSE_MIN       # the session's last bar always flattens
+    m_end = A["mod"] + bm                                      # bar CLOSE time in minutes
+    sess_end = m_end >= CLOSE_MIN                              # the session's last bar always flattens
     events = []
     pos = 0; entry = sl = tg = np.nan; ebar = 0; strike = 0; tscore = 0
     risk_pts = np.nan; be_done = False; cons_loss = 0
@@ -329,7 +371,7 @@ def run_state(d):
                 hit_sl = (not same) and A["high"][i] >= sl
                 hit_tg = (not same) and A["low"][i] <= tg
             opp = (not same) and ((pos == 1 and sell[i]) or (pos == -1 and buy[i]))
-            tm = bool(sess_end[i]) or A["mod"][i] >= CLOSE_MIN - c["square_off_min"] or (c["max_hold"] > 0 and i - ebar >= c["max_hold"])
+            tm = bool(sess_end[i]) or m_end[i] >= CLOSE_MIN - c["square_off_min"] or (c["max_hold"] > 0 and i - ebar >= c["max_hold"])
             kind = None
             if hit_sl:
                 kind, px = ("BREAKEVEN STOP" if be_done else "STOP-LOSS HIT"), sl
@@ -389,13 +431,13 @@ def format_event(e):
     if e["kind"] == "ENTRY":
         return (f"BUY NIFTY {e['strike']} {side}\n"
                 f"Spot entry: {e['entry']:.1f}\nTarget (spot): {e['tg']:.1f}\nStop-loss (spot): {e['sl']:.1f}\n"
-                f"Score: {e['score']}/100 ({grade(e['score'])})\nCandle close: {t} IST\n"
+                f"Score: {e['score']}/100 ({grade(e['score'])})\nCandle start: {t} IST ({CFG['bar_minutes']}m bar)\n"
                 f"Option premium: check your broker (not auto-fetched).\nScore is a confluence rating, not a win probability.")
     if e["kind"] == "MOVE STOP TO BREAKEVEN":
         return (f"MOVE STOP TO BREAKEVEN\nNIFTY {e['strike']} {side}\n"
                 f"New spot stop-loss: {e['sl']:.1f} (entry {e['entry']:.1f})\nTarget unchanged: {e['tg']:.1f}\n"
-                f"Spot now: {e['spot']:.1f}\nCandle close: {t} IST\nMove your stop manually in your broker.")
-    return f"{e['kind']}\nNIFTY {e['strike']} {side}\nSpot: {e['spot']:.1f}\nP&L: {e['pnl']:+.1f} spot pts\nCandle close: {t} IST"
+                f"Spot now: {e['spot']:.1f}\nCandle start: {t} IST\nMove your stop manually in your broker.")
+    return f"{e['kind']}\nNIFTY {e['strike']} {side}\nSpot: {e['spot']:.1f}\nP&L: {e['pnl']:+.1f} spot pts\nCandle start: {t} IST"
 
 
 def format_html(e):
@@ -425,7 +467,7 @@ def format_html(e):
 <tr><td style="background:{col};padding:22px 24px;{FONT}">
   <div style="color:#f1f3f4;font-size:12px;letter-spacing:1.5px;font-weight:600;">NEW SIGNAL &middot; BUY {word}</div>
   <div style="color:#ffffff;font-size:28px;font-weight:800;margin-top:6px;">NIFTY {e['strike']} {side}</div>
-  <div style="color:#ffffff;font-size:13px;margin-top:6px;">Candle close {t} IST</div>
+  <div style="color:#ffffff;font-size:13px;margin-top:6px;">{CFG['bar_minutes']}m candle starting {t} IST</div>
 </td></tr>
 <tr><td style="padding:18px 24px 6px 24px;{FONT}">
   <div style="font-size:12px;color:#5f6368;letter-spacing:1px;font-weight:600;">CONFLUENCE SCORE</div>
@@ -518,20 +560,22 @@ def save_state(s):
     json.dump(s, open(STATE_FILE, "w"))
 
 def check_once(df=None):
-    df = fetch_5m() if df is None else df
+    bm = CFG["bar_minutes"]
+    df = fetch_bars() if df is None else df
     if len(df) < 120:
         print("Not enough bars yet:", len(df)); return
     d = build(df)
     last_ts = d.index[-1]
-    print(f"[{pd.Timestamp.now(tz=TZ):%H:%M:%S} IST] latest closed bar: {last_ts:%d-%b %H:%M} close {d['close'].iloc[-1]:.1f}")
+    print(f"[{pd.Timestamp.now(tz=TZ):%H:%M:%S} IST] latest closed {bm}m bar: {last_ts:%d-%b %H:%M} (close {d['close'].iloc[-1]:.1f})")
     events = run_state(d)
     st = load_state()
     sent = st.get("sent", [])
     now = datetime.now(d.index.tz)
+    # event ts is the bar START. Catch events from the last 3 bars (a delayed cloud run may skip a candle),
+    # but never anything older than 3 bars (45 min on 15m), so a lost state file cannot cause old alerts.
+    max_age = timedelta(minutes=3 * bm)
     for e in events:
-        # catch events from the last 3 bars (a delayed cloud run may skip a candle),
-        # but never anything older than 20 minutes, so a lost state file cannot cause old alerts
-        if e["i"] < len(d) - 3 or (now - e["ts"]) > timedelta(minutes=20):
+        if e["i"] < len(d) - 3 or (now - e["ts"]) > max_age:
             continue
         key = f"{e['ts'].isoformat()}|{e['kind']}"
         if key in sent:
@@ -554,15 +598,16 @@ def main():
     ap.add_argument("--ignore-market", action="store_true", help="with --once: run even outside market hours")
     a = ap.parse_args()
     if a.test:
-        notify("NIFTY notifier test", "Test message from nifty_notifier.py. If you can read this, notifications work.")
+        notify("NIFTY notifier test", "Test message from nifty_notifier_15m.py. If you can read this, notifications work.")
         return
     if a.selftest:
         selftest(); return
+    bm = CFG["bar_minutes"]
     if a.once:
         if not a.ignore_market and not market_open_now():
             print(f"[{pd.Timestamp.now(tz=TZ):%a %d-%b %H:%M:%S} IST] Market closed (Mon-Fri 09:15-15:40 IST) - nothing to do."); return
         check_once(); return
-    print("Running. Ctrl+C to stop. Checks every 5-minute candle close during market hours (Mon-Fri 09:15-15:30 IST).")
+    print(f"Running. Ctrl+C to stop. Checks every {bm}-minute candle close during market hours (Mon-Fri 09:15-15:30 IST).")
     while True:
         try:
             if market_open_now():
@@ -570,24 +615,29 @@ def main():
         except Exception as ex:
             print("[error]", ex)
         now = datetime.now()
-        wait = 300 - (now.minute % 5) * 60 - now.second + 8   # a few seconds after each 5m close
+        wait = bm * 60 - (now.minute % bm) * 60 - now.second + 8   # a few seconds after each bar close
         time.sleep(max(15, wait))
 
 def selftest():
+    bm = CFG["bar_minutes"]
     rng = np.random.default_rng(7)
     idx = []
-    for day in pd.bdate_range("2026-11-02", periods=8, tz=TZ):
-        idx += list(pd.date_range(day + pd.Timedelta(hours=9, minutes=15), day + pd.Timedelta(hours=15, minutes=25), freq="5min"))
+    for day in pd.bdate_range("2026-10-12", periods=16, tz=TZ):
+        idx += list(pd.date_range(day + pd.Timedelta(hours=9, minutes=15),
+                                  day + pd.Timedelta(minutes=CLOSE_MIN - bm), freq=f"{bm}min"))
     idx = pd.DatetimeIndex(idx)
-    steps = rng.normal(0.4, 9, len(idx))
+    scale = np.sqrt(bm / 5.0)
+    steps = rng.normal(0.4 * bm / 5, 9 * scale, len(idx))
     close = 24500 + np.cumsum(steps)
     openp = np.concatenate([[close[0]], close[:-1]])
-    high = np.maximum(openp, close) + rng.uniform(0, 6, len(idx))
-    low = np.minimum(openp, close) - rng.uniform(0, 6, len(idx))
+    high = np.maximum(openp, close) + rng.uniform(0, 6 * scale, len(idx))
+    low = np.minimum(openp, close) - rng.uniform(0, 6 * scale, len(idx))
     df = pd.DataFrame(dict(open=openp, high=high, low=low, close=close, volume=0.0), index=idx)
     d = build(df)
     ev = run_state(d)
-    print(f"selftest OK: {len(df)} bars, {len(ev)} events")
+    print(f"selftest OK: {len(df)} bars ({bm}m, HTF {CFG['htf_minutes']}m), {len(ev)} events")
+    print(f"derived bar settings: brk_look={CFG['brk_look']} piv={CFG['piv_left']}/{CFG['piv_right']} "
+          f"chop_window={CFG['chop_window']} cd_same={CFG['cd_same']} cd_opp={CFG['cd_opp']}")
     for e in ev[:6]:
         print(format_event(e), "\n---")
 
